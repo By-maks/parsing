@@ -2,11 +2,14 @@ name: Telegram to VK Publisher
 
 on:
   schedule:
-    # Каждые 20 минут (оптимально для лимитов)
-    - cron: '*/10 * * * *'
+    # Каждые 20 минут
+    - cron: '*/20 * * * *'
   workflow_dispatch:  # Ручной запуск
   push:
-    branches: [ main ]  # Запуск при обновлении кода
+    branches: [ main, master ]
+    paths:
+      - 'publisher.py'
+      - '.github/workflows/*.yml'
 
 jobs:
   publish:
@@ -16,21 +19,23 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v3
       with:
-        fetch-depth: 0  # Полная история для коммитов
+        fetch-depth: 0
     
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.10'
-        cache: 'pip'  # Кэширование зависимостей
+        cache: 'pip'
     
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests
+        pip install -r requirements.txt || pip install requests
     
-    - name: Create temp directory
-      run: mkdir -p temp_media
+    - name: Create necessary directories
+      run: |
+        mkdir -p temp_media
+        touch processed_posts.json || echo "{}" > processed_posts.json
     
     - name: Run publisher
       env:
@@ -40,9 +45,19 @@ jobs:
         VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
       run: python publisher.py
     
-    - name: Commit and push processed IDs
+    - name: Commit and push changes
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         git add processed_posts.json
-        git diff --quiet && git diff --staged --quiet || (git commit -m "🔄 Update processed posts [skip ci]" && git push)
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "🔄 Update processed posts [skip ci]"
+          git push
+        fi
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        rm -rf temp_media
