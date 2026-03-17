@@ -10,7 +10,7 @@ import logging
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
@@ -35,9 +35,6 @@ class TelegramToVKPublisher:
         self.temp_dir = 'temp_media'
         os.makedirs(self.temp_dir, exist_ok=True)
         
-        # Типы контента, которые игнорируем
-        self.ignored_content_types = ['sticker', 'animation', 'voice', 'audio', 'poll']
-        
         logger.info(f"✅ Инициализация завершена. Канал: {self.telegram_channel}")
 
     def load_processed_ids(self):
@@ -55,6 +52,7 @@ class TelegramToVKPublisher:
     def save_processed_id(self, message_id: str, message_hash: str = None):
         """Сохранение ID обработанного поста"""
         try:
+            # Сохраняем с временной меткой
             self.processed_data[message_id] = {
                 'timestamp': datetime.now().isoformat(),
                 'hash': message_hash
@@ -71,6 +69,8 @@ class TelegramToVKPublisher:
             
             with open(self.processed_ids_file, 'w', encoding='utf-8') as f:
                 json.dump(self.processed_data, f, ensure_ascii=False, indent=2)
+            
+            logger.debug(f"💾 Сохранен ID {message_id}")
             
         except Exception as e:
             logger.error(f"Ошибка сохранения processed_id: {e}")
@@ -93,25 +93,6 @@ class TelegramToVKPublisher:
         
         return self.telegram_channel
 
-    def is_ignored_content(self, post: Dict) -> bool:
-        """Проверка, является ли контент игнорируемым (стикеры, голосовые и т.д.)"""
-        # Проверяем наличие игнорируемых типов контента
-        for content_type in self.ignored_content_types:
-            if content_type in post:
-                logger.info(f"🚫 Пропускаем {content_type} (ID: {post.get('message_id')})")
-                return True
-        
-        # Проверяем, есть ли в посте только игнорируемый контент
-        has_media = any(key in post for key in ['photo', 'video', 'document'])
-        has_ignored = any(key in post for key in self.ignored_content_types)
-        
-        # Если есть только игнорируемый контент и нет текста - пропускаем
-        if has_ignored and not has_media and not post.get('text') and not post.get('caption'):
-            logger.info(f"🚫 Пост содержит только игнорируемый контент")
-            return True
-            
-        return False
-
     def get_telegram_posts(self, limit: int = 15) -> List[Dict]:
         """Получение последних постов ТОЛЬКО из указанного канала"""
         channel_id = self.get_channel_id()
@@ -128,16 +109,12 @@ class TelegramToVKPublisher:
             response = requests.get(url, params=params, timeout=35)
             data = response.json()
             
-            posts_dict = {}
+            posts_dict = {}  # Используем словарь для уникальности по message_id
             
             if data.get('ok'):
                 for update in data.get('result', []):
                     if 'channel_post' in update:
                         post = update['channel_post']
-                        
-                        # Пропускаем игнорируемый контент
-                        if self.is_ignored_content(post):
-                            continue
                         
                         # Проверяем, что пост именно из нашего канала
                         post_chat_id = str(post['chat']['id'])
@@ -149,20 +126,18 @@ class TelegramToVKPublisher:
                         )
                         
                         if is_our_channel:
+                            # ВАЖНО: Используем message_id как основной идентификатор!
                             message_id = str(post['message_id'])
                             chat_id = post_chat_id
+                            
+                            # Создаем уникальный ID на основе chat_id и message_id
                             unique_id = f"{chat_id}_{message_id}"
                             
+                            # Если такой пост уже есть в словаре, пропускаем
                             if unique_id in posts_dict:
                                 continue
                             
-                            # Извлекаем медиа
-                            media = self.extract_media(post)
-                            
-                            # Если нет медиа и нет текста - пропускаем
-                            if not media and not post.get('text') and not post.get('caption'):
-                                continue
-                            
+                            # Создаем хеш содержимого
                             content_hash = self.create_content_hash(post)
                             
                             posts_dict[unique_id] = {
@@ -174,15 +149,22 @@ class TelegramToVKPublisher:
                                 'caption': post.get('caption', ''),
                                 'date': post['date'],
                                 'media_group_id': post.get('media_group_id'),
-                                'media': media,
+                                'media': self.extract_media(post),
                                 'hash': content_hash
                             }
+                            
+                            logger.debug(f"📝 Найден пост {unique_id}")
             
+            # Преобразуем словарь в список
             posts = list(posts_dict.values())
+            
+            # Группируем посты из одной медиагруппы
             posts = self.group_media_posts(posts)
+            
+            # Сортируем по дате (новые сверху)
             posts.sort(key=lambda x: x['date'], reverse=True)
             
-            logger.info(f"📥 Получено {len(posts)} постов (игнорируемый контент исключен)")
+            logger.info(f"📥 Получено {len(posts)} уникальных постов")
             return posts
             
         except Exception as e:
@@ -191,17 +173,18 @@ class TelegramToVKPublisher:
 
     def create_content_hash(self, post: Dict) -> str:
         """Создание хеша содержимого поста"""
-        content = post.get('text', '') or post.get('caption', '')
+        content = ""
+        
+        # Добавляем текст
+        content += post.get('text', '') or post.get('caption', '')
         
         # Добавляем информацию о медиа
         if 'photo' in post:
             content += f"photo_{len(post['photo'])}"
         if 'video' in post:
-            content += f"video_{post['video']['file_id'][:20]}"
+            content += f"video_{post['video']['file_id']}"
         if 'document' in post:
-            # Для документов добавляем имя файла если есть
-            file_name = post['document'].get('file_name', '')
-            content += f"doc_{file_name}"
+            content += f"doc_{post['document']['file_id']}"
         
         return hashlib.md5(content.encode()).hexdigest() if content else ""
 
@@ -214,69 +197,64 @@ class TelegramToVKPublisher:
             if post.get('media_group_id'):
                 group_id = post['media_group_id']
                 if group_id not in groups:
+                    # Берем первый пост как основной
                     groups[group_id] = post.copy()
                     groups[group_id]['media'] = post.get('media', []).copy()
+                    groups[group_id]['media_group_posts'] = [post['id']]
                 else:
-                    # Добавляем новые медиа
-                    existing_files = {m['file_id'] for m in groups[group_id]['media']}
-                    for media in post.get('media', []):
-                        if media['file_id'] not in existing_files:
-                            groups[group_id]['media'].append(media)
-                    
-                    # Объединяем текст
-                    if post.get('caption') and not groups[group_id].get('caption'):
-                        groups[group_id]['caption'] = post['caption']
-                    if post.get('text') and not groups[group_id].get('text'):
-                        groups[group_id]['text'] = post['text']
+                    # Добавляем медиа из дополнительных постов
+                    groups[group_id]['media'].extend(post.get('media', []))
+                    groups[group_id]['media_group_posts'].append(post['id'])
             else:
                 standalone.append(post)
         
-        return standalone + list(groups.values())
+        # Объединяем
+        result = standalone + list(groups.values())
+        
+        # Удаляем дубликаты медиа в группах
+        for item in result:
+            if 'media' in item:
+                # Удаляем дубликаты по file_id
+                seen = set()
+                unique_media = []
+                for media in item['media']:
+                    if media['file_id'] not in seen:
+                        seen.add(media['file_id'])
+                        unique_media.append(media)
+                item['media'] = unique_media
+        
+        return result
 
     def extract_media(self, post: Dict) -> List[Dict]:
         """Извлечение медиа из поста"""
         media = []
         
-        # Фото
         if 'photo' in post and post['photo']:
-            # Берем самую большую версию
             file_id = post['photo'][-1]['file_id']
             media.append({'type': 'photo', 'file_id': file_id})
         
-        # Видео
         if 'video' in post:
-            media.append({
-                'type': 'video', 
-                'file_id': post['video']['file_id']
-            })
+            media.append({'type': 'video', 'file_id': post['video']['file_id']})
         
-        # Документы (только изображения и видео, не архивы и т.д.)
         if 'document' in post:
-            mime_type = post['document'].get('mime_type', '')
-            # Загружаем только изображения и видео
-            if mime_type.startswith(('image/', 'video/')):
-                media.append({
-                    'type': 'doc',
-                    'file_id': post['document']['file_id'],
-                    'mime_type': mime_type
-                })
-            else:
-                logger.info(f"📄 Пропускаем документ {mime_type}")
+            media.append({'type': 'doc', 'file_id': post['document']['file_id']})
         
         return media
 
     def is_duplicate(self, post: Dict) -> bool:
         """Проверка на дубликат поста"""
-        # Проверка по ID
+        # Основная проверка по ID
         if post['id'] in self.processed_data:
+            logger.info(f"⏭️ Пост {post['id']} уже был опубликован (ID)")
             return True
         
-        # Проверка по хешу (только для постов за последний час)
+        # Проверка по хешу (для одинакового контента)
         if post.get('hash'):
             for saved_id, saved_data in self.processed_data.items():
                 if isinstance(saved_data, dict) and saved_data.get('hash') == post['hash']:
+                    # Проверяем, что пост не слишком старый
                     timestamp = datetime.fromisoformat(saved_data['timestamp'])
-                    if datetime.now() - timestamp < timedelta(hours=1):
+                    if datetime.now() - timestamp < timedelta(days=1):
                         logger.info(f"⏭️ Пост {post['id']} дублирует содержимое {saved_id}")
                         return True
         
@@ -293,9 +271,7 @@ class TelegramToVKPublisher:
                 file_path = data['result']['file_path']
                 file_url = f"https://api.telegram.org/file/bot{self.telegram_token}/{file_path}"
                 
-                # Создаем уникальное имя файла
-                file_ext = os.path.splitext(file_path)[1]
-                local_filename = os.path.join(self.temp_dir, f"{file_id}{file_ext}")
+                local_filename = os.path.join(self.temp_dir, file_path.split('/')[-1])
                 
                 # Проверяем, не скачан ли уже файл
                 if os.path.exists(local_filename):
@@ -307,9 +283,7 @@ class TelegramToVKPublisher:
                 with open(local_filename, 'wb') as f:
                     f.write(response.content)
                 
-                logger.debug(f"📎 Скачан файл: {local_filename}")
                 return local_filename
-                
         except Exception as e:
             logger.error(f"Ошибка скачивания файла: {e}")
         return None
@@ -357,65 +331,18 @@ class TelegramToVKPublisher:
             
             if 'error' not in save_data:
                 photo = save_data['response'][0]
-                attachment = f"photo{photo['owner_id']}_{photo['id']}"
-                logger.debug(f"✅ Фото загружено: {attachment}")
-                return attachment
+                return f"photo{photo['owner_id']}_{photo['id']}"
             
         except Exception as e:
             logger.error(f"Ошибка загрузки фото: {e}")
         return None
 
-    def upload_video_to_vk(self, file_path: str) -> Optional[str]:
-        """Загрузка видео в VK"""
-        try:
-            url = 'https://api.vk.com/method/video.save'
-            params = {
-                'group_id': self.vk_group_id,
-                'name': os.path.basename(file_path),
-                'access_token': self.vk_token,
-                'v': '5.131'
-            }
-            
-            response = requests.get(url, params=params, timeout=30)
-            data = response.json()
-            
-            if 'error' in data:
-                logger.error(f"Ошибка VK API: {data['error']}")
-                return None
-            
-            upload_url = data['response']['upload_url']
-            
-            # Загружаем видео
-            with open(file_path, 'rb') as f:
-                files = {'video_file': f}
-                upload_response = requests.post(upload_url, files=files, timeout=300)
-            
-            upload_data = upload_response.json()
-            
-            attachment = f"video{upload_data['owner_id']}_{upload_data['video_id']}"
-            logger.debug(f"✅ Видео загружено: {attachment}")
-            return attachment
-            
-        except Exception as e:
-            logger.error(f"Ошибка загрузки видео: {e}")
-        return None
-
-    def upload_to_vk(self, file_path: str, file_type: str, mime_type: str = None) -> Optional[str]:
+    def upload_to_vk(self, file_path: str, file_type: str) -> Optional[str]:
         """Загрузка медиа в VK"""
-        # Определяем тип по MIME если нужно
-        if file_type == 'doc' and mime_type:
-            if mime_type.startswith('image/'):
-                file_type = 'photo'
-            elif mime_type.startswith('video/'):
-                file_type = 'video'
-        
-        # Загружаем соответствующий тип
         if file_type == 'photo':
             return self.upload_photo_to_vk(file_path)
-        elif file_type == 'video':
-            return self.upload_video_to_vk(file_path)
         else:
-            logger.warning(f"⚠️ Тип {file_type} не поддерживается для загрузки")
+            logger.warning(f"Тип {file_type} пока не поддерживается")
             return None
 
     def publish_to_vk(self, text: str, attachments: List[str] = None) -> Dict:
@@ -434,24 +361,12 @@ class TelegramToVKPublisher:
             'v': '5.131'
         }
         
-        if attachments and len(attachments) > 0:
-            # В VK максимум 10 вложений
-            if len(attachments) > 10:
-                attachments = attachments[:10]
+        if attachments:
             params['attachments'] = ','.join(attachments)
-            logger.info(f"📎 Вложения: {len(attachments)} шт.")
         
         try:
             response = requests.post(url, params=params, timeout=30)
-            data = response.json()
-            
-            if 'error' in data:
-                logger.error(f"Ошибка VK API при публикации: {data['error']}")
-                return data
-            
-            logger.info(f"✅ Пост опубликован в VK")
-            return data
-            
+            return response.json()
         except Exception as e:
             logger.error(f"Ошибка публикации: {e}")
             return {'error': str(e)}
@@ -474,6 +389,8 @@ class TelegramToVKPublisher:
         for post in posts:
             if not self.is_duplicate(post):
                 new_posts.append(post)
+            else:
+                logger.debug(f"Пост {post['id']} пропущен (дубликат)")
         
         if not new_posts:
             logger.info("📭 Новых постов не найдено")
@@ -487,6 +404,7 @@ class TelegramToVKPublisher:
             try:
                 logger.info(f"\n{'─' * 40}")
                 logger.info(f"📝 Обработка поста {i}/{len(new_posts)}")
+                logger.info(f"🆔 ID: {post['id']}")
                 
                 attachments = []
                 
@@ -497,15 +415,10 @@ class TelegramToVKPublisher:
                     
                     if file_path:
                         logger.info(f"☁️ Загрузка в VK...")
-                        attachment = self.upload_to_vk(
-                            file_path, 
-                            media_item['type'],
-                            media_item.get('mime_type')
-                        )
-                        
+                        attachment = self.upload_to_vk(file_path, media_item['type'])
                         if attachment:
                             attachments.append(attachment)
-                            logger.info(f"✅ {media_item['type']} загружено")
+                            logger.info(f"✅ Медиа загружено: {attachment}")
                         
                         # Удаляем временный файл
                         try:
@@ -516,8 +429,9 @@ class TelegramToVKPublisher:
                 # Текст поста
                 text = post.get('caption') or post.get('text') or ''
                 
-                # Публикуем в VK только если есть текст или вложения
+                # Публикуем в VK
                 if text or attachments:
+                    logger.info(f"📤 Публикация в VK...")
                     result = self.publish_to_vk(text, attachments)
                     
                     if 'response' in result:
@@ -527,9 +441,9 @@ class TelegramToVKPublisher:
                         
                         post_id = result['response']['post_id']
                         vk_url = f"https://vk.com/wall-{self.vk_group_id}_{post_id}"
-                        logger.info(f"✅ Готово: {vk_url}")
+                        logger.info(f"✅ Пост опубликован: {vk_url}")
                     else:
-                        logger.error(f"❌ Ошибка публикации")
+                        logger.error(f"❌ Ошибка публикации: {result}")
                 else:
                     logger.warning(f"⚠️ Пост пустой, пропускаем")
                 
@@ -542,7 +456,7 @@ class TelegramToVKPublisher:
                 continue
         
         logger.info("=" * 60)
-        logger.info(f"✅ Обработано: {published_count}/{len(new_posts)}")
+        logger.info(f"✅ Обработка завершена. Опубликовано: {published_count}/{len(new_posts)}")
         logger.info("=" * 60)
 
 if __name__ == "__main__":
